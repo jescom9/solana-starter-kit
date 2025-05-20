@@ -2,7 +2,7 @@ use anchor_lang::prelude::*;
 
 use chainlink_solana as chainlink;
 
-declare_id!("CnrgKig7fjYfWkxNVWkNwNMziuarP1Aiu7MkJuXRWEY5");
+declare_id!("Dohk3pwpNSQGts4AQLZVMeqEViofrT5ND7KwGdrCy8fz");
 
 #[program]
 pub mod chainlink_solana_demo {
@@ -13,19 +13,23 @@ pub mod chainlink_solana_demo {
     pub fn execute(
         ctx: Context<Execute>
     ) -> Result<()> {
+        let chainlink_program_info = ctx.accounts.chainlink_program.clone();
+        let chainlink_feed_info = ctx.accounts.chainlink_feed.clone();
+
         let round: Round = chainlink::latest_round_data(
-            ctx.accounts.chainlink_program.to_account_info(),
-            ctx.accounts.chainlink_feed.to_account_info(),
-        )?;
+            chainlink_program_info,
+            chainlink_feed_info,
+        ).map_err(|_e| error!(ErrorCode::ChainlinkError))?;
 
         let description: String = chainlink::description(
-            ctx.accounts.chainlink_program.to_account_info(),
-            ctx.accounts.chainlink_feed.to_account_info(),
-        )?;
+            ctx.accounts.chainlink_program.clone(),
+            ctx.accounts.chainlink_feed.clone(),
+        ).map_err(|_e| error!(ErrorCode::ChainlinkError))?;
 
         let decimals: u8 = chainlink::decimals(
-            ctx.accounts.chainlink_program.to_account_info(), 
-            ctx.accounts.chainlink_feed.to_account_info())?;
+            ctx.accounts.chainlink_program.clone(),
+            ctx.accounts.chainlink_feed.clone(),
+        ).map_err(|_e| error!(ErrorCode::ChainlinkError))?;
 
         let decimal: &mut Account<Decimal> = &mut ctx.accounts.decimal;
         decimal.value = round.answer;
@@ -82,4 +86,10 @@ impl std::fmt::Display for Decimal {
         }
         f.write_str(&scaled_val)
     }
+}
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Chainlink error occurred")]
+    ChainlinkError,
 }
