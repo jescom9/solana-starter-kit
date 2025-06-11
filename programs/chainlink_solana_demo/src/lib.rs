@@ -1,8 +1,11 @@
 use anchor_lang::prelude::*;
-
-use chainlink_solana as chainlink;
+use anchor_lang::solana_program::clock::Clock;
+use pyth_solana_receiver_sdk::price_update::{get_feed_id_from_hex, PriceUpdateV2};
 
 declare_id!("41Np7rprA1XXuJ7k83PMh6e5adpyFkdJ2NPh1sGd72A9");
+
+// Chainlink program ID on Devnet
+pub const CHAINLINK_PROGRAM_ID: Pubkey = pubkey!("HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny");
 
 #[program]
 pub mod chainlink_solana_demo {
@@ -26,6 +29,7 @@ pub mod chainlink_solana_demo {
         id: u8,
         price: u64,
         decimals: u8,
+        pyth_feed_id: String,
     ) -> Result<()> {
         let registry = &mut ctx.accounts.asset_registry;
 
@@ -34,18 +38,65 @@ pub mod chainlink_solana_demo {
             return Err(ErrorCode::AssetAlreadyExists.into());
         }
 
+        // Convert hex string to feed ID
+        let feed_id = get_feed_id_from_hex(&pyth_feed_id)?;
+
         registry.assets.push(AssetInfo {
             id,
             price,
             decimals,
+            pyth_feed_id: feed_id,
         });
 
         msg!(
-            "Added asset: id={}, price={}, decimals={}",
+            "Added asset: id={}, price={}, decimals={}, pyth_feed_id={}",
             id,
             price,
-            decimals
+            decimals,
+            pyth_feed_id
         );
+        Ok(())
+    }
+
+    pub fn update_price_from_pyth(ctx: Context<UpdatePriceFromPyth>, asset_id: u8) -> Result<()> {
+        let registry = &mut ctx.accounts.asset_registry;
+
+        // Find asset
+        let asset = registry
+            .assets
+            .iter_mut()
+            .find(|a| a.id == asset_id)
+            .ok_or(ErrorCode::AssetNotFound)?;
+
+        // Get price from Pyth price update account
+        let price_update = &ctx.accounts.price_update;
+        let clock = Clock::get()?;
+        let maximum_age: u64 = 300; // 5 minutes maximum age
+
+        let price =
+            price_update.get_price_no_older_than(&clock, maximum_age, &asset.pyth_feed_id)?;
+
+        // Convert price to our standard format (price is already in the right scale)
+        let new_price = if price.exponent < 0 {
+            // If exponent is negative, we need to scale down
+            (price.price as u64) / 10u64.pow((-price.exponent) as u32)
+        } else {
+            // If exponent is positive, scale up
+            (price.price as u64) * 10u64.pow(price.exponent as u32)
+        };
+
+        let old_price = asset.price;
+        asset.price = new_price;
+
+        msg!(
+            "Updated asset {} price: {} -> {} (pyth: {} * 10^{})",
+            asset_id,
+            old_price,
+            new_price,
+            price.price,
+            price.exponent
+        );
+
         Ok(())
     }
 
@@ -145,7 +196,7 @@ pub mod chainlink_solana_demo {
         msg!("Added deposit: asset_id={}, amount={}", asset_id, amount);
 
         // Perform health check
-        perform_health_check(&ctx.accounts.obligation, &ctx.accounts.asset_registry)?;
+        perform_health_check(ctx, asset_id, 0)?;
 
         Ok(())
     }
@@ -181,7 +232,7 @@ pub mod chainlink_solana_demo {
         }
 
         // Perform health check
-        perform_health_check(&ctx.accounts.obligation, &ctx.accounts.asset_registry)?;
+        perform_health_check(ctx, 0, asset_id)?;
 
         Ok(())
     }
@@ -218,7 +269,7 @@ pub mod chainlink_solana_demo {
         }
 
         // Perform health check
-        perform_health_check(&ctx.accounts.obligation, &ctx.accounts.asset_registry)?;
+        perform_health_check(ctx, asset_id, 0)?;
 
         Ok(())
     }
@@ -250,7 +301,7 @@ pub mod chainlink_solana_demo {
         }
 
         // Perform health check
-        perform_health_check(&ctx.accounts.obligation, &ctx.accounts.asset_registry)?;
+        perform_health_check(ctx, 0, asset_id)?;
 
         Ok(())
     }
@@ -267,10 +318,11 @@ pub mod chainlink_solana_demo {
 
         for asset in &registry.assets {
             msg!(
-                "Asset: id={}, price={}, decimals={}",
+                "Asset: id={}, price={}, decimals={}, pyth_feed_id={:?}",
                 asset.id,
                 asset.price,
-                asset.decimals
+                asset.decimals,
+                asset.pyth_feed_id
             );
         }
 
@@ -307,207 +359,255 @@ pub mod chainlink_solana_demo {
         Ok(())
     }
 
-    use chainlink_solana::Round;
+    pub fn delete_obligation(_ctx: Context<DeleteObligation>) -> Result<()> {
+        msg!(
+            "Obligation for owner {} deleted",
+            _ctx.accounts.obligation.owner
+        );
+        Ok(())
+    }
 
-    use super::*;
-    pub fn execute(ctx: Context<Execute>) -> Result<()> {
-        let round: Round = chainlink::latest_round_data(
-            ctx.accounts.chainlink_program.to_account_info(),
-            ctx.accounts.chainlink_feed.to_account_info(),
-        )?;
+    pub fn delete_asset_registry(_ctx: Context<DeleteAssetRegistry>) -> Result<()> {
+        msg!("Asset registry deleted");
+        Ok(())
+    }
 
-        let description: String = chainlink::description(
-            ctx.accounts.chainlink_program.to_account_info(),
-            ctx.accounts.chainlink_feed.to_account_info(),
-        )?;
+    pub fn demonstrate_oracle_price_pull(
+        ctx: Context<DemonstrateOraclePrices>,
+        asset_id: u8,
+    ) -> Result<()> {
+        let registry = &ctx.accounts.asset_registry;
 
-        let decimals: u8 = chainlink::decimals(
-            ctx.accounts.chainlink_program.to_account_info(),
-            ctx.accounts.chainlink_feed.to_account_info(),
-        )?;
+        // Find asset
+        let asset = registry
+            .assets
+            .iter()
+            .find(|a| a.id == asset_id)
+            .ok_or(ErrorCode::AssetNotFound)?;
 
-        let decimal: &mut Account<Decimal> = &mut ctx.accounts.decimal;
-        decimal.value = round.answer;
-        decimal.decimals = u32::from(decimals);
+        msg!("=== PYTH ORACLE PRICE DEMONSTRATION ===");
+        msg!("Asset ID: {}", asset_id);
+        msg!("Hardcoded price: ${}", asset.price);
+        msg!("Pyth feed ID: {:?}", asset.pyth_feed_id);
 
-        let decimal_print: Decimal = Decimal::new(round.answer, u32::from(decimals));
-        msg!("{} price is {}", description, decimal_print);
+        // Get price from Pyth price update account
+        let price_update = &ctx.accounts.price_update;
+        let clock = Clock::get()?;
+        let maximum_age: u64 = 300; // 5 minutes maximum age
+
+        let price =
+            price_update.get_price_no_older_than(&clock, maximum_age, &asset.pyth_feed_id)?;
+
+        // Convert price to our standard format
+        let oracle_price = if price.exponent < 0 {
+            (price.price as u64) / 10u64.pow((-price.exponent) as u32)
+        } else {
+            (price.price as u64) * 10u64.pow(price.exponent as u32)
+        };
+
+        msg!("Pyth raw price: {}", price.price);
+        msg!("Pyth exponent: {}", price.exponent);
+        msg!("Pyth confidence: {}", price.conf);
+        msg!("Pyth price (converted): ${}", oracle_price);
+        msg!(
+            "Price difference: ${}",
+            if oracle_price > asset.price {
+                oracle_price - asset.price
+            } else {
+                asset.price - oracle_price
+            }
+        );
+        msg!(
+            "Price difference %: {}%",
+            if asset.price > 0 {
+                if oracle_price > asset.price {
+                    ((oracle_price - asset.price) * 100) / asset.price
+                } else {
+                    ((asset.price - oracle_price) * 100) / asset.price
+                }
+            } else {
+                0
+            }
+        );
+
+        msg!("=== DEMONSTRATION COMPLETE ===");
         Ok(())
     }
 }
 
 // ========== HEALTH CHECK FUNCTION ==========
 
-fn perform_health_check(obligation: &Obligation, registry: &AssetRegistry) -> Result<()> {
-    msg!("=== HEALTH CHECK START ===");
+pub fn perform_health_check(
+    ctx: Context<ModifyObligation>,
+    _asset_a: u8,
+    _asset_b: u8,
+) -> Result<()> {
+    let obligation = &mut ctx.accounts.obligation;
+    let asset_registry = &ctx.accounts.asset_registry;
+    let price_update = &ctx.accounts.price_update;
+
     msg!(
-        "Deposits: {}, Borrows: {}",
+        "🔍 Starting health check for obligation with {} deposits and {} borrows",
         obligation.deposits.len(),
         obligation.borrows.len()
     );
 
-    // If no borrows, obligation is healthy by default
-    if obligation.borrows.is_empty() {
-        msg!("Health: OK (no borrows)");
-        return Ok(());
-    }
+    let mut total_deposit_value: u64 = 0;
+    let mut total_borrow_value: u64 = 0;
 
-    // Calculate total deposit and borrow values
-    let mut deposit_values: Vec<(u8, u64)> = Vec::new(); // (asset_id, value)
-    let mut borrow_values: Vec<(u8, u64)> = Vec::new(); // (asset_id, value)
-    let mut total_deposit_value = 0u64;
-    let mut total_borrow_value = 0u64;
-
-    // Calculate deposit values
+    // Process deposits with real-time Pyth prices
     for deposit in &obligation.deposits {
-        let asset = registry
-            .assets
-            .iter()
-            .find(|a| a.id == deposit.asset_id)
-            .ok_or(ErrorCode::AssetNotFound)?;
+        let asset_info = &asset_registry.assets[deposit.asset_id as usize];
 
-        let value = deposit.amount.saturating_mul(asset.price);
-        deposit_values.push((deposit.asset_id, value));
-        total_deposit_value = total_deposit_value.saturating_add(value);
+        // Try to get real price from Pyth oracle
+        let current_price = match get_pyth_price(price_update, &asset_info.pyth_feed_id) {
+            Ok(price) => {
+                msg!(
+                    "📈 Real Pyth price for asset {}: ${:.2} (feed ID available)",
+                    deposit.asset_id,
+                    price as f64 / 100.0
+                );
+                price
+            }
+            Err(_) => {
+                msg!(
+                    "⚠️ Failed to get Pyth price for asset {}, using fallback price: ${:.2}",
+                    deposit.asset_id,
+                    asset_info.price as f64 / 100.0
+                );
+                asset_info.price
+            }
+        };
+
+        let deposit_value = calculate_value(deposit.amount, current_price, asset_info.decimals);
+        total_deposit_value = total_deposit_value.checked_add(deposit_value).unwrap();
 
         msg!(
-            "Deposit: id={}, amount={}, price={}, value={}",
+            "💰 Deposit: Asset {} = {} units × ${:.2} = ${:.2}",
             deposit.asset_id,
             deposit.amount,
-            asset.price,
-            value
+            current_price as f64 / 100.0,
+            deposit_value as f64 / 100.0
         );
     }
 
-    // Calculate borrow values
+    // Process borrows with real-time Pyth prices
     for borrow in &obligation.borrows {
-        let asset = registry
-            .assets
-            .iter()
-            .find(|a| a.id == borrow.asset_id)
-            .ok_or(ErrorCode::AssetNotFound)?;
+        let asset_info = &asset_registry.assets[borrow.asset_id as usize];
 
-        let value = borrow.amount.saturating_mul(asset.price);
-        borrow_values.push((borrow.asset_id, value));
-        total_borrow_value = total_borrow_value.saturating_add(value);
+        // Try to get real price from Pyth oracle
+        let current_price = match get_pyth_price(price_update, &asset_info.pyth_feed_id) {
+            Ok(price) => {
+                msg!(
+                    "📈 Real Pyth price for asset {}: ${:.2} (feed ID available)",
+                    borrow.asset_id,
+                    price as f64 / 100.0
+                );
+                price
+            }
+            Err(_) => {
+                msg!(
+                    "⚠️ Failed to get Pyth price for asset {}, using fallback price: ${:.2}",
+                    borrow.asset_id,
+                    asset_info.price as f64 / 100.0
+                );
+                asset_info.price
+            }
+        };
+
+        let borrow_value = calculate_value(borrow.amount, current_price, asset_info.decimals);
+        total_borrow_value = total_borrow_value.checked_add(borrow_value).unwrap();
 
         msg!(
-            "Borrow: id={}, amount={}, price={}, value={}",
+            "🔴 Borrow: Asset {} = {} units × ${:.2} = ${:.2}",
             borrow.asset_id,
             borrow.amount,
-            asset.price,
-            value
+            current_price as f64 / 100.0,
+            borrow_value as f64 / 100.0
         );
     }
 
-    msg!("Total deposit value: {}", total_deposit_value);
-    msg!("Total borrow value: {}", total_borrow_value);
+    // Calculate health score using real-time prices
+    let health_score = if total_borrow_value == 0 {
+        u64::MAX // Infinite health score if no borrows
+    } else {
+        total_deposit_value
+            .checked_mul(1000)
+            .unwrap()
+            .checked_div(total_borrow_value)
+            .unwrap()
+    };
 
-    // Complex health score calculation
-    // Health = Sum(deposit_i * Sum(borrow_share_j * risk_factor_ij)) / total_borrow
-    let mut weighted_health_score = 0u64;
+    obligation.health_score = health_score;
 
-    // For each deposit
-    for (deposit_id, deposit_value) in &deposit_values {
-        msg!("Processing deposit {}: value={}", deposit_id, deposit_value);
-        let mut deposit_risk_sum = 0u64;
-
-        // For each borrow
-        for (borrow_id, borrow_value) in &borrow_values {
-            // Find risk parameter for this deposit-borrow pair
-            let risk_param = registry.risk_params.iter().find(|p| {
-                (p.asset_id_a == *deposit_id && p.asset_id_b == *borrow_id)
-                    || (p.asset_id_a == *borrow_id && p.asset_id_b == *deposit_id)
-            });
-
-            let risk_level = if let Some(param) = risk_param {
-                param.risk_level as u64
-            } else {
-                // Default risk level if pair not found
-                msg!(
-                    "  Warning: No risk param for pair {}-{}, using default 50",
-                    deposit_id,
-                    borrow_id
-                );
-                50
-            };
-
-            // Calculate borrow share (scaled by 100 for precision)
-            let borrow_share = borrow_value
-                .saturating_mul(100)
-                .checked_div(total_borrow_value)
-                .unwrap_or(0);
-
-            // Add to deposit risk sum: borrow_share * risk_level
-            let risk_contribution = borrow_share.saturating_mul(risk_level);
-            deposit_risk_sum = deposit_risk_sum.saturating_add(risk_contribution);
-
-            msg!(
-                "  Pair {}-{}: borrow_value={}, share={}%, risk={}, contribution={}",
-                deposit_id,
-                borrow_id,
-                borrow_value,
-                borrow_share,
-                risk_level,
-                risk_contribution
-            );
-        }
-
-        // Multiply deposit value by its weighted risk (divide by 100 to adjust for scaling)
-        let weighted_deposit_value = deposit_value
-            .saturating_mul(deposit_risk_sum)
-            .checked_div(100)
-            .unwrap_or(0);
-
-        weighted_health_score = weighted_health_score.saturating_add(weighted_deposit_value);
-
-        msg!(
-            "  Deposit {} total: risk_sum={}, weighted_value={}",
-            deposit_id,
-            deposit_risk_sum,
-            weighted_deposit_value
-        );
-    }
-
-    // Final health score calculation
-    // We have: weighted_health_score (already divided by 100 once)
-    // Need to divide by total_borrow_value
-    // But we want to keep decimal precision, so multiply by 1000 first
-    let final_health_score_x1000 = weighted_health_score
-        .saturating_mul(1000)
-        .checked_div(total_borrow_value)
-        .unwrap_or(0)
-        .checked_div(100) // Divide by 100 for the risk scaling
-        .unwrap_or(0);
-
-    msg!("=== FINAL CALCULATION ===");
-    msg!("Weighted health score sum: {}", weighted_health_score);
-    msg!("Total borrow value: {}", total_borrow_value);
-    msg!("Health score x1000: {}", final_health_score_x1000);
+    msg!("📊 Health Check Results (Using Real Pyth Prices):");
     msg!(
-        "Health score: {}.{}",
-        final_health_score_x1000 / 1000,
-        final_health_score_x1000 % 1000
+        "   Total Deposit Value: ${:.2}",
+        total_deposit_value as f64 / 100.0
+    );
+    msg!(
+        "   Total Borrow Value: ${:.2}",
+        total_borrow_value as f64 / 100.0
+    );
+    msg!("   Health Score: {} (minimum required: 1000)", health_score);
+
+    if health_score < 1000 {
+        msg!(
+            "🚨 LIQUIDATION ALERT: Health score {} is below minimum 1000!",
+            health_score
+        );
+        return Err(ErrorCode::InsufficientCollateral.into());
+    } else {
+        msg!("✅ Position is healthy with score: {}", health_score);
+    }
+
+    Ok(())
+}
+
+// Helper function to get price from Pyth PriceUpdateV2 account
+fn get_pyth_price(price_update_account: &AccountInfo, feed_id: &[u8; 32]) -> Result<u64> {
+    use pyth_solana_receiver_sdk::price_update::PriceUpdateV2;
+
+    // Try to deserialize as PriceUpdateV2
+    let price_update =
+        match PriceUpdateV2::try_deserialize(&mut price_update_account.data.borrow().as_ref()) {
+            Ok(update) => update,
+            Err(_) => {
+                msg!("⚠️ Failed to deserialize PriceUpdateV2 account");
+                return Err(ErrorCode::InvalidPriceUpdate.into());
+            }
+        };
+
+    // Get price with maximum age of 60 seconds
+    let price_feed = price_update.get_price_no_older_than(
+        &Clock::get()?,
+        60, // Maximum age in seconds
+        feed_id,
+    )?;
+
+    // Convert price to our format (price in cents)
+    let price_scaled = if price_feed.exponent >= 0 {
+        (price_feed.price as u64)
+            .checked_mul(10_u64.pow(price_feed.exponent as u32))
+            .unwrap_or(0)
+    } else {
+        (price_feed.price as u64)
+            .checked_div(10_u64.pow((-price_feed.exponent) as u32))
+            .unwrap_or(0)
+    };
+
+    // Convert to cents (multiply by 100)
+    let price_in_cents = price_scaled.checked_mul(100).unwrap_or(0);
+
+    msg!(
+        "🔍 Pyth price details: price={}, exponent={}, scaled_price={}, final_price_cents={}",
+        price_feed.price,
+        price_feed.exponent,
+        price_scaled,
+        price_in_cents
     );
 
-    // Check if healthy (health score should be >= 1000 for 1.0 or 100% collateralization)
-    if final_health_score_x1000 < 1000 {
-        msg!(
-            "⚠️ WARNING: Health score {}.{} is below 1.0 - Position at risk!",
-            final_health_score_x1000 / 1000,
-            final_health_score_x1000 % 1000
-        );
-        return Err(ErrorCode::Unhealthy.into());
-    } else {
-        msg!(
-            "✓ Health check PASSED - Score: {}.{}",
-            final_health_score_x1000 / 1000,
-            final_health_score_x1000 % 1000
-        );
-    }
-
-    msg!("=== HEALTH CHECK END ===");
-    Ok(())
+    Ok(price_in_cents)
 }
 
 // ========== CONTEXTS ==========
@@ -569,6 +669,8 @@ pub struct ModifyObligation<'info> {
     )]
     pub asset_registry: Account<'info, AssetRegistry>,
     pub owner: Signer<'info>,
+    /// CHECK: Pyth price update account for health check oracle prices
+    pub price_update: AccountInfo<'info>,
 }
 
 #[derive(Accounts)]
@@ -583,6 +685,69 @@ pub struct DebugReadData<'info> {
         bump
     )]
     pub obligation: Account<'info, Obligation>,
+}
+
+#[derive(Accounts)]
+pub struct UpdatePriceFromPyth<'info> {
+    #[account(
+        mut,
+        seeds = [b"asset_registry"],
+        bump
+    )]
+    pub asset_registry: Account<'info, AssetRegistry>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub price_update: Account<'info, PriceUpdateV2>,
+}
+
+#[derive(Accounts)]
+pub struct DeleteRiskParam<'info> {
+    #[account(
+        mut,
+        seeds = [b"asset_registry"],
+        bump,
+        has_one = authority
+    )]
+    pub asset_registry: Account<'info, AssetRegistry>,
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct DeleteObligation<'info> {
+    #[account(
+        mut,
+        seeds = [b"obligation", owner.key().as_ref()],
+        bump,
+        close = owner
+    )]
+    pub obligation: Account<'info, Obligation>,
+    #[account(mut)]
+    pub owner: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct DeleteAssetRegistry<'info> {
+    #[account(
+        mut,
+        seeds = [b"asset_registry"],
+        bump,
+        close = authority
+    )]
+    pub asset_registry: Account<'info, AssetRegistry>,
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct DemonstrateOraclePrices<'info> {
+    #[account(
+        seeds = [b"asset_registry"],
+        bump
+    )]
+    pub asset_registry: Account<'info, AssetRegistry>,
+    pub price_update: Account<'info, PriceUpdateV2>,
 }
 
 // ========== ERROR CODES ==========
@@ -607,6 +772,19 @@ pub enum ErrorCode {
     Unhealthy,
     #[msg("Math operation overflowed")]
     MathOverflow,
+    // PYTH ORACLE ERROR CODES
+    #[msg("Wrong Pyth feed ID provided for asset")]
+    WrongOracleFeed,
+    #[msg("Invalid Pyth price update accounts provided")]
+    InvalidOracleAccounts,
+    #[msg("Missing Pyth price for asset")]
+    MissingOraclePrice,
+    #[msg("Pyth price is too old")]
+    PythPriceTooOld,
+    #[msg("Insufficient collateral")]
+    InsufficientCollateral,
+    #[msg("Invalid price update")]
+    InvalidPriceUpdate,
 }
 
 // ========== DATA STRUCTURES ==========
@@ -626,6 +804,7 @@ pub struct AssetInfo {
     pub id: u8,
     pub price: u64,
     pub decimals: u8,
+    pub pyth_feed_id: [u8; 32],
 }
 
 #[derive(Debug, Clone, AnchorSerialize, AnchorDeserialize, PartialEq, Eq, InitSpace)]
@@ -649,51 +828,25 @@ pub struct Obligation {
     pub deposits: Vec<Position>,
     #[max_len(10)]
     pub borrows: Vec<Position>,
+    pub health_score: u64,
 }
 
-#[derive(Accounts)]
-pub struct Execute<'info> {
-    #[account(mut)]
-    pub user: Signer<'info>,
-    #[account(
-        init,
-        payer = user,
-        space = 100,
-    )]
-    pub decimal: Account<'info, Decimal>,
+// ========== DECIMAL HANDLING FUNCTIONS ==========
 
-    /// CHECK: We're reading data from this specified chainlink feed
-    pub chainlink_feed: AccountInfo<'info>,
-    /// CHECK: This is the Chainlink program library on Devnet
-    pub chainlink_program: AccountInfo<'info>,
-    /// CHECK: This is the devnet system program
-    pub system_program: Program<'info, System>,
+fn scale_amount(amount: u64, decimals: u8) -> u64 {
+    amount.checked_mul(10u64.pow(decimals as u32)).unwrap_or(0)
 }
 
-#[account]
-pub struct Decimal {
-    pub value: i128,
-    pub decimals: u32,
+fn unscale_amount(amount: u64, decimals: u8) -> u64 {
+    amount.checked_div(10u64.pow(decimals as u32)).unwrap_or(0)
 }
 
-impl Decimal {
-    pub fn new(value: i128, decimals: u32) -> Self {
-        Decimal { value, decimals }
-    }
-}
-
-impl std::fmt::Display for Decimal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut scaled_val = self.value.to_string();
-        if scaled_val.len() <= self.decimals as usize {
-            scaled_val.insert_str(
-                0,
-                &vec!["0"; self.decimals as usize - scaled_val.len()].join(""),
-            );
-            scaled_val.insert_str(0, "0.")
-        } else {
-            scaled_val.insert(scaled_val.len() - self.decimals as usize, '.');
-        }
-        f.write_str(&scaled_val)
-    }
+fn calculate_value(amount: u64, price: u64, decimals: u8) -> u64 {
+    // Scale the amount to match the price's decimal places
+    let scaled_amount = scale_amount(amount, decimals);
+    // Multiply by price and divide by 10^decimals to maintain precision
+    scaled_amount
+        .checked_mul(price)
+        .and_then(|v| v.checked_div(10u64.pow(decimals as u32)))
+        .unwrap_or(0)
 }

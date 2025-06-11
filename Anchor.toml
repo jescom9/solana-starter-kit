@@ -5,11 +5,10 @@ resolution = true
 skip-lint = false
  
 
-[registry]
-url = "https://buildstation.stakingfacilities.com/?api-key=QH3msz6kOaAMaKSMMGcoAc4ytcSAKneE" 
 [provider]
-cluster = "devnet"
+cluster = "https://buildstation.stakingfacilities.com/?api-key=QH3msz6kOaAMaKSMMGcoAc4ytcSAKneE"
 wallet = "id.json"
 
 [scripts]
 test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+ 
